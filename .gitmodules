@@ -1,0 +1,3 @@
+[submodule "vendor/ad-preflight"]
+	path = vendor/ad-preflight
+	url = https://github.com/yagaMI-Reverse/ad-preflight.git
