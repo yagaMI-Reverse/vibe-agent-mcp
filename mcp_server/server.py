@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """MCP-сервер поверх Agent API Вайб-Маркетолога.
 
-Отдаёт Claude Code 6 инструментов: 4 бесплатных read-only (аккаунт, бренды,
-цены, локальный preflight) и 2 платных write-инструмента (генерация
-объявлений, аудит лендинга) — оба с бюджетным гейтом и идемпотентностью.
+Отдаёт Claude Code 8 инструментов: 5 бесплатных read-only (аккаунт, бренды,
+цены, локальный preflight с локальным фиксером длины) и 3 платных
+write-инструмента (генерация объявлений, аудит лендинга, sitelinks) — все
+с идемпотентностью.
 
 Запуск: python mcp_server/server.py
 Регистрация в Claude Code: claude mcp add vibe -- python <путь>/mcp_server/server.py
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -18,9 +18,11 @@ from mcp.server.mcpserver import MCPServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vendor" / "ad-preflight"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "orchestrator"))
 
 import vibe_client as vc
 import preflight as pf  # vendor/ad-preflight/preflight.py — не переписываем чек-логику
+import run_agent as orch  # общий с оркестратором run_preflight()+локальный фиксер длины
 
 mcp = MCPServer("vibe-marketolog")
 
@@ -89,30 +91,18 @@ def generate_sitelinks(url: str, idempotency_key: str = "") -> dict:
 def preflight_check(groups: list, landing_url: str) -> dict:
     """Прогоняет результат generate_ads через детерминированный чек
     (ad-preflight): лимиты Яндекс.Директа, ст.5 ФЗ «О рекламе», сверка
-    обещаний с текстом лендинга. Полностью бесплатно и локально — не бьёт
-    в API. `groups` — это gen["result"]["groups"] из ответа generate_ads."""
-    landing = pf.fetch_landing_text(landing_url)
-    results = []
-    for g in groups:
-        combo = g.get("combinatorial", {})
-        kws = [pf.as_str(k, "keyword", "phrase", "text", "name") for k in g.get("keywords", [])]
-        for t in [pf.as_str(x, "title", "text") for x in combo.get("titles", [])]:
-            for x in [pf.as_str(y, "text", "body") for y in combo.get("texts", [])]:
-                results.append(pf.check_ad(t.strip(), x.strip(), kws, landing))
-    counts: dict = {}
-    for r in results:
-        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-    top_rules: dict = {}
-    for r in results:
-        for msg in r["errors"] + r["warnings"] + r["halluc"]:
-            key = msg.split(":")[0] if ":" in msg else msg.split("«")[0] if "«" in msg else msg
-            key = re.sub(r"\s+", " ", re.sub(r"\d+%?", "", key)).strip()
-            top_rules[key] = top_rules.get(key, 0) + 1
+    обещаний с текстом лендинга — и локальный фиксер: объявления, забракованные
+    только за превышение длины, механически обрезаются по границе слова и
+    перепроверяются (просить генератор словами короче — доказанно не работает,
+    см. docs/boundaries.md). Полностью бесплатно и локально — не бьёт в API.
+    `groups` — это gen["result"]["groups"] из ответа generate_ads."""
+    pfres = orch.run_preflight(groups, landing_url)
     return {
-        "total": len(results),
-        "counts": counts,
-        "top_rules": sorted(top_rules.items(), key=lambda kv: -kv[1])[:5],
-        "details": results,
+        "total": pfres["total"],
+        "counts": pfres["counts"],
+        "fixed_locally": pfres["fixed_locally"],
+        "top_rules": pfres["top_rules"][:5],
+        "details": pfres["details"],
     }
 
 

@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Автономный цикл: генерация объявлений → preflight → переформулировка → стоп.
+"""Автономный цикл: генерация объявлений → preflight → локальный фикс → стоп.
 
 Задача агента: «сделай кампанию для <лендинга>» без участия человека —
 1. проверить деньги (account_status, price_table) — бюджетный гейт ДО каждого
    платного вызова, не после;
 2. сгенерировать объявления (direct/ads-generate, 49₽ фикс.);
 3. прогнать через preflight (детерминированные проверки, ad-preflight, 0₽);
-4. если есть БРАК/ГАЛЛЮЦИНАЦИЯ — переформулировать utp по самым частым
-   причинам и повторить;
+4. механически починить то, что чинится локально и бесплатно (превышение
+   длины заголовка/текста — просто обрезка по слову), а не просить генератор
+   переписать словами: живой прогон 31.07.2026 показал, что текстовая
+   инструкция в utp про длину заголовка НЕ снижает брак, а увеличивает его
+   (90→111→153 за 3 итерации, см. docs/boundaries.md). Переформулировка utp
+   оставлена только для содержательных дефектов (непроверенные превосходные
+   степени, обещания без подтверждения на лендинге) — их локально не почини,
+   там правда нужна другая генерация;
 5. остановиться, когда выдача чистая либо упёрлись в лимит бюджета/итераций;
-6. записать отчёт: итерации, потрачено ₽, брак по итерациям, топ правил.
+6. записать отчёт: итерации, потрачено ₽, брак по итерациям, сколько починено
+   локально, топ правил.
 
 Запуск:
   python orchestrator/run_agent.py --url https://example.ru --utp "..." \
@@ -40,11 +47,12 @@ DEFAULT_BUDGET_RUB = 3 * vc.KNOWN_PRICES_RUB["direct/ads-generate"] + vc.KNOWN_P
 
 CLEAN_VERDICTS = {"ГОДНО", "ИСПРАВИМО"}  # то, с чем можно запускать кампанию
 
-# Причина дефекта → уточнение, которое дописывается в utp следующей итерации.
+# Только содержательные дефекты — то, что локальный фиксер (обрезка длины)
+# принципиально не может починить, потому что это не про символы, а про смысл.
+# "заголовок"/"текст"/"слово" сюда намеренно не входят: доказано (31.07.2026),
+# что просьба словами в utp не помогает и даже вредит — эти дефекты чинятся
+# только локальной обрезкой (см. try_fix_length ниже).
 REFORMULATIONS = {
-    "заголовок": "Каждый заголовок строго до 56 знаков включительно, короче и без деепричастных оборотов.",
-    "текст": "Каждый текст объявления строго до 81 знака включительно.",
-    "слово": "Не используй слова длиннее 22 знаков без переносов.",
     "превосходная степень без подтверждения": (
         "Не используй превосходную степень («лучший», «№1», «самый», «100%») без цифр на лендинге."
     ),
@@ -64,6 +72,47 @@ def build_utp(base_utp: str, top_rules: list) -> str:
     if not extra:
         return base_utp
     return (base_utp + " " if base_utp else "") + " ".join(extra)
+
+
+def truncate_at_word(s: str, limit: int) -> str:
+    """Обрезает строку по границе слова, не разрывая слово посередине."""
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,.–—-")
+
+
+LENGTH_ERROR_PREFIXES = ("заголовок", "текст")
+
+
+def is_fixable_length_only(errors: list) -> bool:
+    """True, если единственная причина БРАК — превышение длины заголовка/текста
+    (не длинное слово без пробелов — его обрезкой не почини, там нужна другая
+    формулировка, а таких случаев мало)."""
+    return bool(errors) and all(e.startswith(LENGTH_ERROR_PREFIXES) for e in errors)
+
+
+def apply_local_fixes(results: list, landing: str) -> tuple:
+    """Механическая пост-обработка: только обрезка по длине, без изменения
+    смысла. Не трогает ГАЛЛЮЦИНАЦИЯ/превосходные степени — там подделка
+    вердикта обрезкой была бы нечестной, эти дефекты остаются как есть."""
+    fixed_count = 0
+    out = []
+    for r in results:
+        if r["verdict"] == "БРАК" and not r["halluc"] and is_fixable_length_only(r["errors"]):
+            new_title = truncate_at_word(r["title"], pf.TITLE1_MAX)
+            new_text = truncate_at_word(r["text"], pf.TEXT_MAX)
+            candidate = pf.check_ad(new_title, new_text, r.get("_keywords", []), landing)
+            if candidate["verdict"] != "БРАК":
+                candidate["fixed_locally"] = True
+                candidate["original_title"] = r["title"]
+                out.append(candidate)
+                fixed_count += 1
+                continue
+        out.append(r)
+    return out, fixed_count
 
 
 def categorize_rule(msg: str) -> str:
@@ -88,7 +137,12 @@ def run_preflight(groups: list, landing_url: str) -> dict:
         kws = [pf.as_str(k, "keyword", "phrase", "text", "name") for k in g.get("keywords", [])]
         for t in [pf.as_str(x, "title", "text") for x in combo.get("titles", [])]:
             for x in [pf.as_str(y, "text", "body") for y in combo.get("texts", [])]:
-                results.append(pf.check_ad(t.strip(), x.strip(), kws, landing))
+                r = pf.check_ad(t.strip(), x.strip(), kws, landing)
+                r["_keywords"] = kws
+                results.append(r)
+
+    results, fixed_count = apply_local_fixes(results, landing)
+
     counts: dict = {}
     for r in results:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
@@ -98,7 +152,13 @@ def run_preflight(groups: list, landing_url: str) -> dict:
             key = categorize_rule(msg)
             top_rules[key] = top_rules.get(key, 0) + 1
     ranked = sorted(top_rules.items(), key=lambda kv: -kv[1])
-    return {"total": len(results), "counts": counts, "top_rules": ranked, "details": results}
+    return {
+        "total": len(results),
+        "counts": counts,
+        "top_rules": ranked,
+        "details": results,
+        "fixed_locally": fixed_count,
+    }
 
 
 def load_fixture_groups() -> list:
@@ -164,7 +224,8 @@ def main() -> None:
 
         groups = gen.get("result", {}).get("groups", [])
         pfres = run_preflight(groups, a.url)
-        print(f"    потрачено на шаге: {cost}₽ (всего {spent}₽) | вердикты: {pfres['counts']}")
+        print(f"    потрачено на шаге: {cost}₽ (всего {spent}₽) | вердикты: {pfres['counts']} "
+              f"| починено локально: {pfres['fixed_locally']}")
 
         log.append({
             "iteration": iteration,
@@ -173,6 +234,7 @@ def main() -> None:
             "counts": pfres["counts"],
             "top_rules": pfres["top_rules"],
             "total_ads": pfres["total"],
+            "fixed_locally": pfres["fixed_locally"],
         })
 
         defective = pfres["counts"].get("БРАК", 0) + pfres["counts"].get("ГАЛЛЮЦИНАЦИЯ", 0)
@@ -222,8 +284,8 @@ def write_report(out_path, url, base_utp, log, stop_reason, spent, audit_result,
         "",
         "## Итерации",
         "",
-        "| # | стоимость,₽ | всего объявл. | ГОДНО | ИСПРАВИМО | БРАК | ГАЛЛЮЦИНАЦИЯ | топ-правило |",
-        "|---|---|---|---|---|---|---|---|",
+        "| # | стоимость,₽ | всего объявл. | ГОДНО | ИСПРАВИМО | БРАК | ГАЛЛЮЦИНАЦИЯ | починено локально | топ-правило |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for it in log:
         c = it["counts"]
@@ -231,7 +293,7 @@ def write_report(out_path, url, base_utp, log, stop_reason, spent, audit_result,
         lines.append(
             f"| {it['iteration']} | {it['cost_rub']} | {it['total_ads']} | "
             f"{c.get('ГОДНО', 0)} | {c.get('ИСПРАВИМО', 0)} | {c.get('БРАК', 0)} | "
-            f"{c.get('ГАЛЛЮЦИНАЦИЯ', 0)} | {top} |"
+            f"{c.get('ГАЛЛЮЦИНАЦИЯ', 0)} | {it['fixed_locally']} | {top} |"
         )
     lines += ["", "## utp по итерациям", ""]
     for it in log:
